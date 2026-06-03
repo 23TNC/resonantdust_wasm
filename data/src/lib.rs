@@ -16,3 +16,9 @@
 //! incrementally, in parallel with current development.
 
 pub mod bits;
+pub mod bridge;
+pub mod loader;
+pub mod parser;
+pub mod resolve;
+pub mod validate;
+pub mod vm;

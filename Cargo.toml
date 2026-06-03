@@ -16,8 +16,10 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = []
 # Enable wasm-bindgen-annotated public API for browser consumption.
-js = ["dep:wasm-bindgen"]
+js = ["dep:wasm-bindgen", "dep:serde_json"]
 
 [dependencies]
 resonantdust-data = { path = "data" }
 wasm-bindgen = { version = "0.2", optional = true }
+# JSON marshalling for the browser boundary only (the plain logic stays typed).
+serde_json = { version = "1", optional = true }

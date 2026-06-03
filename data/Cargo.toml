@@ -13,3 +13,6 @@ path = "src/lib.rs"
 crate-type = ["rlib"]
 
 [dependencies]
+# Derive-only: lets the wasm bindings (and the gate's wire) serialize the value
+# types (Cell/Plan/Card). No runtime serde format is chosen here.
+serde = { version = "1", features = ["derive"] }

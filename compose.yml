@@ -23,6 +23,18 @@ services:
     entrypoint: ["cargo"]
     command: ["test", "--workspace"]
 
+  # Corpus acceptance: parse every content `.rd`, build one symbol table, then
+  # validate + resolve each file. Mounts the repo root so the crate (wasm/) and
+  # the content (content/data) are both visible. The load-bearing cross-file
+  # lint — catches renames, missing art, duplicate/dangling `$` refs.
+  corpus:
+    image: clockworklabs/spacetime:latest
+    volumes:
+      - ..:/workspace
+    working_dir: /workspace/wasm
+    entrypoint: ["cargo"]
+    command: ["run", "--quiet", "-p", "resonantdust-data", "--bin", "corpus", "--", "/workspace/content/data"]
+
   # Builds the JS/wasm bundle the pixijs client imports.
   #
   # We bypass wasm-pack and call `cargo build` + `wasm-bindgen` directly —
