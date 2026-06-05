@@ -36,9 +36,63 @@ pub fn set_field(word: u32, offset: u32, width: u32, value: u32) -> u32 {
   (word & !m) | ((value << offset) & m)
 }
 
+// ---- packed definitions & tile slots ---------------------------------
+//
+// The two `u16` wire layouts the gate / client / modules share (mirrors
+// `content/cards/packed.rs`; ported here so the DSL runtime owns the codec):
+//
+//   packed_def   = [ card_type:u4 (bits 12-15) | def_id:u12 (bits 0-11) ]
+//   tile slot    = [ stock1:u2 (bits 14-15) | stock0:u2 (bits 12-13) | def_id:u12 ]
+//
+// The 64-tile-per-zone packing (tile slots laid into 16 `u64`s) stays a
+// regions-module concern; these are the single-value primitives it builds on.
+
+/// Mask isolating a packed definition's `def_id` (low 12 bits).
+pub const DEF_ID_MASK: u16 = 0x0FFF;
+
+/// Pack `[card_type:u4 | def_id:u12]`. Over-wide inputs are masked to width.
+pub fn pack_def(card_type: u8, def_id: u16) -> u16 {
+  (((card_type & 0xF) as u16) << 12) | (def_id & DEF_ID_MASK)
+}
+
+/// Split a packed definition into `(card_type, def_id)`.
+pub fn unpack_def(packed: u16) -> (u8, u16) {
+  (((packed >> 12) & 0xF) as u8, packed & DEF_ID_MASK)
+}
+
+/// Pack one Zone tile slot `[def_id:u12 | stock0:u2 | stock1:u2]`. Stock values
+/// clamp to their 2-bit field; `def_id` to 12 bits.
+pub fn pack_tile_slot(def_id: u16, stock0: u8, stock1: u8) -> u16 {
+  (def_id & DEF_ID_MASK)
+    | (((stock0 as u16) & 0x3) << 12)
+    | (((stock1 as u16) & 0x3) << 14)
+}
+
+/// Split a Zone tile slot into `(def_id, stock0, stock1)`.
+pub fn unpack_tile_slot(slot: u16) -> (u16, u8, u8) {
+  (slot & DEF_ID_MASK, ((slot >> 12) & 0x3) as u8, ((slot >> 14) & 0x3) as u8)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn packed_def_round_trips() {
+    // tile (type 7), def_id 42
+    let p = pack_def(7, 42);
+    assert_eq!(unpack_def(p), (7, 42));
+    // over-wide def_id is masked to 12 bits, not bleeding into the type nibble
+    assert_eq!(unpack_def(pack_def(7, 0x1FFF)), (7, 0x0FFF));
+  }
+
+  #[test]
+  fn tile_slot_round_trips() {
+    let s = pack_tile_slot(42, 2, 3);
+    assert_eq!(unpack_tile_slot(s), (42, 2, 3));
+    // stocks clamp to 2 bits, def_id stays intact
+    assert_eq!(unpack_tile_slot(pack_tile_slot(0x0FFF, 0xFF, 0xFF)), (0x0FFF, 3, 3));
+  }
 
   #[test]
   fn round_trips() {

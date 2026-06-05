@@ -25,7 +25,8 @@
 
 /// A single token within an instruction line. Classified by leading sigil; any
 /// `::`/`:`/`.` *inside* the token is part of its path and kept verbatim.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// No `Eq`: `Token::Float` carries an `f64`, which is `PartialEq` but not `Eq`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Token {
   /// `$path` — resolve a global symbol (`$card::corpus`, `$functions:ring_objects`).
   Const(String),
@@ -43,12 +44,15 @@ pub enum Token {
   Color(String),
   /// integer literal, including negatives (`10`, `-1`).
   Number(i64),
+  /// float literal — any `.`-bearing token that parses as `f64` (`1.5`, `-0.25`).
+  /// Integers stay `Number`, so existing integer op semantics are unchanged.
+  Float(f64),
   /// bare word: an op (`set`, `if`, `goto`, …) or a content constant (`rtl`).
   Word(String),
 }
 
 /// The header / role of a node.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Header {
   /// `""` root, or a bare structural block.
   Block(String),
@@ -63,7 +67,7 @@ pub enum Header {
 }
 
 /// One item in a code body (hook or function).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
   /// `:loop>` → `LabelDef("loop")` — a jump target in the stream.
   LabelDef(String),
@@ -72,7 +76,7 @@ pub enum Stmt {
 }
 
 /// A node in the block tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Node {
   pub header: Header,
   pub children: Vec<Node>,
@@ -106,15 +110,10 @@ fn is_code_hook(name: &str) -> bool {
   matches!(name, "define" | "init" | "update" | "input" | "output")
 }
 
-/// A `<bucket>` whose body is code rather than nested defs. Only the global
-/// functions (`<functions:name>`) are code-bodied; `<card>`/`<recipe>` nest defs.
-fn is_function_bucket(name: &str) -> bool {
-  name.starts_with("functions:")
-}
 
 // ---------- Lexer ----------
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Raw {
   Angle(String),  // <name>
   DColon(String), // ::name>
@@ -146,10 +145,20 @@ fn classify_token(t: &str) -> Token {
     ':' => Token::Label(t[1..].to_string()),
     '^' => Token::System(t[1..].to_string()),
     '#' => Token::Color(t.to_string()),
-    _ => match t.parse::<i64>() {
-      Ok(n) => Token::Number(n),
-      Err(_) => Token::Word(t.to_string()),
-    },
+    _ => {
+      if let Ok(n) = t.parse::<i64>() {
+        Token::Number(n)
+      } else if t.contains('.') {
+        // Only `.`-bearing tokens try float — keeps bare words (and `inf`/`nan`)
+        // as `Word`, and integers as `Number`.
+        match t.parse::<f64>() {
+          Ok(f) => Token::Float(f),
+          Err(_) => Token::Word(t.to_string()),
+        }
+      } else {
+        Token::Word(t.to_string())
+      }
+    }
   }
 }
 
@@ -212,7 +221,17 @@ fn parse_structural(lines: &[LexLine], i: &mut usize, parent_indent: i64) -> Res
       Raw::Angle(name) => {
         let name = name.clone();
         *i += 1;
-        if is_function_bucket(&name) {
+        if name == "functions" {
+          // `<functions>` holds code-bodied `::name>` defs — each a function
+          // (its body is a flat instruction stream, like a hook). Same `<>`/`::`
+          // grammar as every other space, so functions catalogue + version like
+          // cards. (`<card>`/`<recipe>` `::` defs nest structurally instead.)
+          let c = parse_function_defs(lines, i, line_indent)?;
+          Node { header: Header::Bucket(name), children: c, body: Vec::new() }
+        } else if name.starts_with("functions:") {
+          // Legacy bucket-per-function (`<functions:ring_objects>`): a deprecated
+          // alias still accepted so older sources + the test harness keep
+          // parsing. New content uses `<functions>` + `::name>`.
           let body = parse_body(lines, i, line_indent);
           Node { header: Header::Bucket(name), children: Vec::new(), body }
         } else {
@@ -258,6 +277,35 @@ fn parse_structural(lines: &[LexLine], i: &mut usize, parent_indent: i64) -> Res
     children.push(node);
   }
   Ok(children)
+}
+
+/// Parse the `::name>` defs inside a `<functions>` bucket. Each is a function: a
+/// `Header::Def` whose body is a flat code stream (via [`parse_body`], so its
+/// `:label>` markers stay labels) — unlike a `<card>`/`<recipe>` `::` def, whose
+/// body nests structurally. This is the one place `::` carries code directly.
+fn parse_function_defs(
+  lines: &[LexLine],
+  i: &mut usize,
+  parent_indent: i64,
+) -> Result<Vec<Node>, String> {
+  let mut defs = Vec::new();
+  while *i < lines.len() && (lines[*i].indent as i64) > parent_indent {
+    let line_indent = lines[*i].indent as i64;
+    match &lines[*i].raw {
+      Raw::DColon(name) => {
+        let name = name.clone();
+        *i += 1;
+        let body = parse_body(lines, i, line_indent);
+        defs.push(Node { header: Header::Def(name), children: Vec::new(), body });
+      }
+      _ => {
+        return Err(format!(
+          "<functions> may only contain `::name>` defs (unexpected header at indent {line_indent})"
+        ))
+      }
+    }
+  }
+  Ok(defs)
 }
 
 /// Collect a flat code body: `:label>` markers and instructions more-indented

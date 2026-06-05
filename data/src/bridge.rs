@@ -63,7 +63,12 @@ pub fn card_view(bundle: &Bundle, card: &Card) -> Cell {
   let Some(name) = bundle.card_name(card.def_id).map(str::to_string) else {
     return Cell::Map(Vec::new());
   };
-  store.write("def_id", Cell::Sym(format!("card::{name}")));
+  // Match by LINEAGE, not exact version: the `def_id` symbol is the
+  // version-stripped logical name, so a recipe's `$card::apple` matches any
+  // version (apple.0, apple.1, …). The `@define` below still reads the
+  // version-SPECIFIC def by `name`, so each instance keeps its own
+  // aspects/stock schema even while several versions coexist.
+  store.write("def_id", Cell::Sym(format!("card::{}", crate::loader::lineage(&name))));
 
   // static aspects (type/cost/…) and stock declarations from :data @define
   if let Some(define) = bundle.card(&name).and_then(|d| d.facet("data")).and_then(|f| f.hook("define")) {
@@ -119,6 +124,45 @@ fn satisfies_closure(bundle: &Bundle, name: &str) -> Vec<String> {
     }
   }
   out
+}
+
+/// The def-level default values of a card's first two stock slots (the Zone's
+/// budget) — what a freshly-spawned tile seeds before any `@init` climate pass.
+/// In the DSL the `stock` op initialises a slot to `0`, so this is `(0, 0)`
+/// unless the `:data @define` explicitly sets a value after declaring the slot.
+/// Replaces the legacy `decode_definition().stock[].default`.
+pub fn stock_defaults(bundle: &Bundle, card: &str) -> (u8, u8) {
+  let mut store = Store::default();
+  if let Some(define) = bundle.card(card).and_then(|d| d.facet("data")).and_then(|f| f.hook("define")) {
+    let _ = run(&define.body, &mut store, &[], &bundle.catalog, &Functions::default());
+  }
+  let schema = stock_schema(bundle, card);
+  let read = |i: usize| -> u8 {
+    schema
+      .get(i)
+      .and_then(|(a, _)| store.read(&format!("aspect.{a}")))
+      .map(Cell::as_int)
+      .unwrap_or(0)
+      .clamp(0, 3) as u8
+  };
+  (read(0), read(1))
+}
+
+/// Whether `aspect` rolls up to `ancestor` (equal, or `ancestor` is in its
+/// `satisfies` closure). The DSL equivalent of legacy `is_aspect_descendant`.
+pub fn is_descendant(bundle: &Bundle, aspect: &str, ancestor: &str) -> bool {
+  aspect == ancestor || satisfies_closure(bundle, aspect).iter().any(|a| a == ancestor)
+}
+
+/// The stock-slot index on `card` that a tile-stock op on `op_aspect` targets,
+/// with sub-aspect widening: a slot declared for `pine` answers an op on
+/// `aspect.wood` (pine satisfies wood). Mirrors the legacy `recipe_plan`'s
+/// `def.stock.position(is_aspect_descendant(slot, aspect))`. `None` if the card
+/// declares no stock slot rolling up to `op_aspect`.
+pub fn stock_slot_for_aspect(bundle: &Bundle, card: &str, op_aspect: &str) -> Option<usize> {
+  stock_schema(bundle, card).iter().position(|(aspect, _)| {
+    aspect == op_aspect || satisfies_closure(bundle, aspect).iter().any(|a| a == op_aspect)
+  })
 }
 
 /// Assemble an operating-set frame: write each card's [`card_view`] at its slot
@@ -205,6 +249,30 @@ mod tests {
   }
 
   #[test]
+  fn stock_defaults_and_descendant() {
+    let b = bundle();
+    // grove declares pine/ash stocks but sets no default → (0, 0)
+    assert_eq!(stock_defaults(&b, "grove"), (0, 0));
+    // satisfies roll-up
+    assert!(is_descendant(&b, "pine", "wood"));
+    assert!(is_descendant(&b, "pine", "material")); // transitive
+    assert!(is_descendant(&b, "wood", "wood")); // reflexive
+    assert!(!is_descendant(&b, "pine", "stone"));
+  }
+
+  #[test]
+  fn stock_slot_widens_to_sub_aspect() {
+    let b = bundle();
+    // grove stocks pine (slot 0) + ash (slot 1); both satisfy wood.
+    assert_eq!(stock_slot_for_aspect(&b, "grove", "pine"), Some(0));
+    assert_eq!(stock_slot_for_aspect(&b, "grove", "ash"), Some(1));
+    // an op on the rolled-up `wood` targets the first slot that satisfies it.
+    assert_eq!(stock_slot_for_aspect(&b, "grove", "wood"), Some(0));
+    // a slot the card doesn't stock (even transitively) → none.
+    assert_eq!(stock_slot_for_aspect(&b, "grove", "stone"), None);
+  }
+
+  #[test]
   fn unknown_def_id_is_empty() {
     let b = bundle();
     assert_eq!(card_view(&b, &Card { def_id: 0, stock: vec![] }), Cell::Map(Vec::new()));
@@ -236,5 +304,68 @@ mod tests {
 
     assert!(plan.matched);
     assert_eq!(plan.holds, vec![("slot.1.0".to_string(), Hold::Use)]);
+  }
+
+  #[test]
+  fn lineage_matches_across_versions_and_create_resolves_head() {
+    use crate::loader::{lineage, version_of};
+    use crate::vm::match_recipe;
+
+    let aspects = "<aspect>\n  ::type>\n    @define>\n      traits &section set\n  ::cost>\n    @define>\n      traits &section set\n";
+    // Two versions of the `apple` lineage (distinct defs, distinct cost) plus an
+    // unrelated `corpus`. A `modify` would have produced apple.1 from apple.0.
+    let cards = "<card>\n\
+      \x20 ::apple.0>\n    :data>\n      @define>\n        faculty &aspect.type set\n        1 &aspect.cost set\n\
+      \x20 ::apple.1>\n    :data>\n      @define>\n        faculty &aspect.type set\n        2 &aspect.cost set\n\
+      \x20 ::corpus>\n    :data>\n      @define>\n        faculty &aspect.type set\n";
+    let recipes = "<recipe>\n  ::eat_apple>\n    @input>\n      $card::apple *slot.1.0.def_id eq if &slot.1.0 use\n    @output>\n      10 &sys.duration set\n      &slot.1.0 destroy\n";
+    let b = load(&[
+      ("a.rd".into(), aspects.into()),
+      ("c.rd".into(), cards.into()),
+      ("r.rd".into(), recipes.into()),
+    ])
+    .unwrap();
+
+    // lineage / version helpers
+    assert_eq!(lineage("apple.0"), "apple");
+    assert_eq!(lineage("apple.1"), "apple");
+    assert_eq!(lineage("corpus"), "corpus");
+    assert_eq!(version_of("apple.1"), 1);
+    assert_eq!(version_of("corpus"), 0);
+
+    // both versions are distinct defs (distinct packed ids); existing instances
+    // of either keep their own id, so nothing renumbers.
+    let p0 = b.packed_def("apple.0").unwrap();
+    let p1 = b.packed_def("apple.1").unwrap();
+    assert_ne!(p0, p1);
+
+    // `create $card::apple` resolves the lineage HEAD (apple.1).
+    assert_eq!(b.card_head("apple"), Some("apple.1"));
+    assert_eq!(b.packed_def("apple"), Some(p1));
+
+    // card_view emits the LINEAGE symbol for either version, but reads the
+    // version-SPECIFIC cost — so old + new instances coexist correctly.
+    let a0 = Card { def_id: b.card_def_id("apple.0").unwrap(), stock: vec![] };
+    let a1 = Card { def_id: b.card_def_id("apple.1").unwrap(), stock: vec![] };
+    let v0 = Store::with_root(card_view(&b, &a0));
+    let v1 = Store::with_root(card_view(&b, &a1));
+    assert_eq!(v0.read("def_id"), Some(&Cell::Sym("card::apple".into())));
+    assert_eq!(v1.read("def_id"), Some(&Cell::Sym("card::apple".into())));
+    assert_eq!(v0.read("aspect.cost"), Some(&Cell::Int(1)));
+    assert_eq!(v1.read("aspect.cost"), Some(&Cell::Int(2)));
+
+    // a recipe consuming `$card::apple` matches EITHER version's instance.
+    let input = &b.recipe("eat_apple").unwrap().hook("input").unwrap().body;
+    for apple in [&a0, &a1] {
+      let mut frame = operating_set(&b, &[("slot.1.0", apple)]);
+      let plan = match_recipe(input, &mut frame, &b.catalog, &b.functions).unwrap();
+      assert!(plan.matched, "apple version should match $card::apple");
+    }
+
+    // an unrelated lineage (corpus) does NOT match.
+    let corpus = Card { def_id: b.card_def_id("corpus").unwrap(), stock: vec![] };
+    let mut frame = operating_set(&b, &[("slot.1.0", &corpus)]);
+    let plan = match_recipe(input, &mut frame, &b.catalog, &b.functions).unwrap();
+    assert!(!plan.matched, "corpus must not match $card::apple");
   }
 }

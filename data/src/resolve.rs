@@ -29,50 +29,81 @@ pub struct SymbolTable {
   /// `<aspect>` ids — the satisfies-LUT registry. Doubles as the set of valid
   /// `aspect.<name>` path members (so `aspect.corpus_lit` drift is caught).
   pub aspects: HashSet<String>,
+  /// `<globals>` ids — shared constants referenced as `$globals::id`.
+  pub globals: HashSet<String>,
 }
 
 /// Roots still living as JSON registries — resolution deferred (migrate later).
+/// Visual-primitive kinds are NOT here: they're `^hex`/`^rect`/`^sprite`/`^text`
+/// engine intrinsics (the `^` FFI boundary, see `vm::PRIM_KINDS`), not `$` refs.
+/// `shape` is on its way out.
 const DEFERRED_ROOTS: &[&str] = &["shape", "faction", "type"];
 
 impl SymbolTable {
   /// Add one parsed file's definitions to the table.
   pub fn collect(&mut self, node: &Node) {
     match &node.header {
+      // Every `::`-catalogued space registers each def name AND its lineage, so a
+      // `$<space>::apple` ref resolves whether the corpus holds `apple` or only
+      // versioned defs (`apple.0`, `apple.1`). Uniform across all `$`-addressable
+      // spaces — content is versioned the same way everywhere.
       Header::Bucket(name) if name == "card" => {
         for c in &node.children {
           if let Header::Def(d) = &c.header {
-            self.cards.insert(def_id(d).to_string());
+            register(&mut self.cards, def_id(d));
           }
         }
       }
       Header::Bucket(name) if name == "recipe" => {
         for c in &node.children {
           if let Header::Def(d) = &c.header {
-            self.recipes.insert(def_id(d).to_string());
+            register(&mut self.recipes, def_id(d));
           }
         }
       }
       Header::Bucket(name) if name == "asset" => {
         for c in &node.children {
           if let Header::Def(d) = &c.header {
-            self.assets.insert(def_id(d).to_string(), texture_symbols(c));
+            let id = def_id(d);
+            let syms = texture_symbols(c);
+            // lineage key shares the def's texture LUT (head wins once versioned).
+            let lin = crate::loader::lineage(id);
+            if lin != id {
+              self.assets.entry(lin.to_string()).or_insert_with(|| syms.clone());
+            }
+            self.assets.insert(id.to_string(), syms);
           }
         }
       }
       Header::Bucket(name) if name == "manifest" => {
         for c in &node.children {
           if let Header::Def(d) = &c.header {
-            self.manifest.insert(def_id(d).to_string());
+            register(&mut self.manifest, def_id(d));
           }
         }
       }
       Header::Bucket(name) if name == "aspect" => {
         for c in &node.children {
           if let Header::Def(d) = &c.header {
-            self.aspects.insert(def_id(d).to_string());
+            register(&mut self.aspects, def_id(d));
           }
         }
       }
+      Header::Bucket(name) if name == "globals" => {
+        for c in &node.children {
+          if let Header::Def(d) = &c.header {
+            register(&mut self.globals, def_id(d));
+          }
+        }
+      }
+      Header::Bucket(name) if name == "functions" => {
+        for c in &node.children {
+          if let Header::Def(d) = &c.header {
+            register(&mut self.functions, def_id(d));
+          }
+        }
+      }
+      // legacy bucket-per-function (`<functions:name>`), keyed by the bare name.
       Header::Bucket(name) if name.starts_with("functions:") => {
         self.functions.insert(name["functions:".len()..].to_string());
       }
@@ -87,6 +118,17 @@ impl SymbolTable {
 /// The record id of a `::` def header — the part before any inline `:facet`.
 fn def_id(name: &str) -> &str {
   name.split(':').next().unwrap_or(name)
+}
+
+/// Register a def name in `set`, plus its [`crate::loader::lineage`] (the
+/// version-stripped logical name) so a `$<space>::<lineage>` ref resolves even
+/// when only versioned defs exist. No-op extra insert for a bare name.
+fn register(set: &mut HashSet<String>, id: &str) {
+  set.insert(id.to_string());
+  let lin = crate::loader::lineage(id);
+  if lin != id {
+    set.insert(lin.to_string());
+  }
 }
 
 /// The `&texture.<sym>` symbols an asset def's hooks declare (its LUT).
@@ -217,6 +259,10 @@ fn check_ref(v: &str, table: &SymbolTable, toks: &[Token]) -> Option<String> {
     "aspect" => match seg.first() {
       Some(id) if table.aspects.contains(*id) => None,
       _ => bad("aspect"),
+    },
+    "globals" => match seg.first() {
+      Some(id) if table.globals.contains(*id) => None,
+      _ => bad("global"),
     },
     r if DEFERRED_ROOTS.contains(&r) => None,
     _ => Some(format!("unknown `$` namespace `{root}` in: {}", render(toks))),

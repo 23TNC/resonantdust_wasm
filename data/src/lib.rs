@@ -17,8 +17,20 @@
 
 pub mod bits;
 pub mod bridge;
+pub mod card_model;
+pub mod defs;
+pub mod flags;
+pub mod inspect;
 pub mod loader;
+pub mod locales;
+pub mod noise;
+pub mod packed;
 pub mod parser;
+pub mod plan;
+pub mod recipe;
+pub mod recipe_state;
 pub mod resolve;
 pub mod validate;
 pub mod vm;
+pub mod worldgen;
+

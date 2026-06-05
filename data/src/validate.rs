@@ -34,6 +34,9 @@ fn op_effect(word: &str) -> Option<(u32, u32)> {
     "and" | "or" => (2, 1),
     "not" => (1, 1),
     "add" | "sub" | "mul" | "div" | "mod" => (2, 1),
+    // trig (radians) + the `pi` constant — for DSL-computed ring/layout positions.
+    "sin" | "cos" | "sqrt" => (1, 1),
+    "pi" => (0, 1),
     // deterministic pseudo-random: hash of a seed (pure, so server/client
     // agree). `<seed> random` -> hashed value; range it with `mod`.
     "random" => (1, 1),
@@ -46,6 +49,7 @@ fn op_effect(word: &str) -> Option<(u32, u32)> {
     "range" => (3, 0),
     "vec2" => (3, 0), // x, y, addr -> {x, y}
     "normalize" => (2, 0),
+    "scatter" => (5, 0), // input, lo, hi, seed, addr -> band-relative count + jitter
     "stock" => (2, 0),
     "array" => (2, 0),
     "destroy" => (1, 0),
@@ -177,6 +181,7 @@ pub(crate) fn render(toks: &[Token]) -> String {
       Token::System(s) => format!("^{s}"),
       Token::Color(s) => s.clone(),
       Token::Number(n) => n.to_string(),
+      Token::Float(f) => f.to_string(),
       Token::Word(s) => s.clone(),
     })
     .collect::<Vec<_>>()

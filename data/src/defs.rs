@@ -1,0 +1,781 @@
+//! Client render/UI definition surface — the DSL-native replacement for the
+//! legacy `resonantdust_content` `decodeDefinition` / `aspectInfo` / `aspectValue`.
+//!
+//! These read a card's `:data` + `:visuals` facets (and the `<aspect>` registry)
+//! out of a loaded [`Bundle`] and return render-ready shapes the pixijs client
+//! consumes. The shapes are **DSL-native** (the client reshapes to them): visuals
+//! are `shape` + `color.{bg,title,text}` + `objects[]` + `texture`; aspects are
+//! name-keyed with a multi-parent `satisfies` LUT (not numeric id + single
+//! parent). Pure over `&Bundle`.
+
+use crate::loader::Bundle;
+use crate::vm::{run, Cell, Store};
+use serde::Serialize;
+
+/// One row-mutable aspect slot — `<bits> &aspect.<name> stock` in `:data`.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct StockSlot {
+  pub aspect: String,
+  /// Cap (the declared `<bits>` magnitude; the zone stores it in 2 bits).
+  pub max: i64,
+  /// Seed value the `:data @define` set the aspect to.
+  pub default: i64,
+}
+
+/// A card's render/UI definition, derived from its `.rd` facets.
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+pub struct CardRenderDef {
+  pub card_type: u8,
+  pub def_id: u16,
+  pub key: String,
+  /// The card's type *name* (`&aspect.type`, e.g. `"requisite"`) — the locale
+  /// namespace (`cards.<type>.<key>.label`).
+  pub type_name: String,
+  /// `"hex"` | `"rect"` (from `&shape`, falling back to the type's hex-ness).
+  pub shape: String,
+  /// `0xRRGGBB` (the DSL `#hex` colors parse to integers, like the legacy shape).
+  pub color_bg: i64,
+  pub color_title: i64,
+  pub color_text: i64,
+  /// Card-body texture asset name (from `&texture`), or `None`.
+  pub texture: Option<String>,
+  /// Card-art asset names (from `&objects`), in order.
+  pub objects: Vec<String>,
+  /// Static `(aspect, value)` pairs from `:data @define` (excludes the `type`
+  /// symbol; includes numeric aspects like `cost`, `wood`, …).
+  pub aspects: Vec<(String, i64)>,
+  /// Row-mutable stock slots (positional, mapping to the zone's per-tile slots).
+  pub stock: Vec<StockSlot>,
+  /// Magnetic lifecycle recipe name (`&magnetic.recipe`), or `None`.
+  pub lifecycle_recipe: Option<String>,
+  /// Magnetic phase duration in ms (`&magnetic.duration`), or `None`.
+  pub lifecycle_duration_ms: Option<u64>,
+}
+
+/// An `<aspect>` registry record — DSL-native (multi-parent `satisfies`).
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+pub struct AspectInfo {
+  pub name: String,
+  /// Display glyph (inherited from the first satisfied aspect if omitted).
+  pub icon: String,
+  /// `0xRRGGBB` (inherited if omitted), or `0` if none in the chain.
+  pub color: i64,
+  /// `"aspects"` | `"features"` | `"traits"` (the `&section`).
+  pub section: String,
+  /// Aspects this one IS-A (`&satisfies` names), for matcher widening + display.
+  pub satisfies: Vec<String>,
+  /// Render sprite asset name (`&art`), or `None`.
+  pub art: Option<String>,
+}
+
+/// A 2-component float vector — anchor pivot `0..1`, or primitive coords in
+/// card-space `0..100` (`vec2` → `{x, y}`).
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+pub struct Vec2f {
+  pub x: f64,
+  pub y: f64,
+}
+
+/// A min/max scale envelope, `0..1` (the DSL stores hundredths).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct ScaleF {
+  pub min: f64,
+  pub max: f64,
+}
+
+/// An `<asset>` pack's render metadata — the client's texture registry entry.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct TextureDef {
+  pub id: u32,
+  pub name: String,
+  pub size: i64,
+  pub scale: ScaleF,
+  pub anchor: Vec2f,
+}
+
+/// Every `<asset>` pack as a [`TextureDef`] (id = sorted index + 1). `scale` /
+/// `anchor` are converted from the DSL's hundredths to `0..1`; defaults are
+/// scale `1.0` and anchor `(0.5, 0.5)`.
+pub fn all_textures(bundle: &Bundle) -> Vec<TextureDef> {
+  bundle
+    .catalog
+    .asset_names()
+    .into_iter()
+    .enumerate()
+    .map(|(i, name)| {
+      let cell = bundle.catalog.asset(&name);
+      let field = |k: &str| -> Option<&Cell> {
+        match cell {
+          Some(Cell::Map(m)) => m.iter().find(|(kk, _)| kk == k).map(|(_, v)| v),
+          _ => None,
+        }
+      };
+      let size = field("size").map(Cell::as_int).unwrap_or(0);
+      let scale = match field("scale") {
+        Some(Cell::Ranged { min, max, .. }) => ScaleF { min: *min as f64 / 100.0, max: *max as f64 / 100.0 },
+        _ => ScaleF { min: 1.0, max: 1.0 },
+      };
+      let anchor = match field("anchor") {
+        Some(Cell::Map(m)) => {
+          let g = |k: &str| m.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.as_int()).unwrap_or(50);
+          Vec2f { x: g("x") as f64 / 100.0, y: g("y") as f64 / 100.0 }
+        }
+        _ => Vec2f { x: 0.5, y: 0.5 },
+      };
+      TextureDef { id: i as u32 + 1, name, size, scale, anchor }
+    })
+    .collect()
+}
+
+/// One recipe iterator for the client's discovery matcher: the resolved
+/// parent-path prefix (`""` for top-level), its branch selector, and the
+/// aggregated hold policy of the verbs that bind it (for predicted holds).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct IterMeta {
+  pub parent: String,
+  pub branch: u8,
+  pub slot_hold: bool,
+  pub position_hold: bool,
+}
+
+/// Everything the client needs about a recipe WITHOUT the legacy path-statement
+/// IR (predicate eval runs on the VM via `match_recipe`): iterators (in
+/// `bindings` order), the anchor set (for priority), per-branch arity (combo
+/// search), input-statement count (debounce bypass), and hold policy (predicted
+/// holds).
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeMeta {
+  pub iterators: Vec<IterMeta>,
+  /// Whether the recipe anchors on the action's `root`.
+  pub root: bool,
+  /// Bitmask of top-level branches referenced (bit `n` = branch `n`).
+  pub branches: u16,
+  pub root_slot_hold: bool,
+  pub root_position_hold: bool,
+  /// Number of `@input` statements (≤1 → single-input, debounce-bypass).
+  pub input_count: u32,
+  /// Required card count per top-level branch (`branch_counts[b]` = max offset
+  /// referenced in branch `b`, +1). Index 0..=2.
+  pub branch_counts: [u8; 3],
+}
+
+/// `(slot, position)` hold a verb claims. Mirrors `dsl_recipe::kinds`.
+fn verb_holds(verb: &str) -> Option<(bool, bool)> {
+  match verb {
+    "use" => Some((true, false)),
+    "claim" => Some((true, true)),
+    "share" => Some((false, true)),
+    "borrow" => Some((false, false)),
+    _ => None,
+  }
+}
+
+/// The `(parent, branch)` of a slot path's LAST `slot.<b>.<o>` triple — which
+/// iterator a held `&path` belongs to. `None` for `root` / pathless.
+fn path_iter(path: &str) -> Option<(String, u8)> {
+  let segs: Vec<&str> = path.split('.').collect();
+  let mut prefix = String::new();
+  let mut last: Option<(String, u8)> = None;
+  let mut i = 0;
+  while i < segs.len() {
+    if segs[i] == "slot" && i + 2 < segs.len() {
+      if let (Ok(b), Ok(_o)) = (segs[i + 1].parse::<u8>(), segs[i + 2].parse::<u32>()) {
+        last = Some((prefix.clone(), b));
+        if !prefix.is_empty() {
+          prefix.push('.');
+        }
+        prefix.push_str(&format!("slot.{}.{}", segs[i + 1], segs[i + 2]));
+        i += 3;
+        continue;
+      }
+    }
+    if !prefix.is_empty() {
+      prefix.push('.');
+    }
+    prefix.push_str(segs[i]);
+    i += 1;
+  }
+  last
+}
+
+/// Build a recipe's full [`RecipeMeta`]. `None` if unknown.
+pub fn recipe_meta(bundle: &Bundle, name: &str) -> Option<RecipeMeta> {
+  use crate::parser::{Stmt, Token};
+  let node = bundle.recipe(name)?;
+  let iters = crate::recipe::iterators(node);
+  let mut branches = 0u16;
+  for it in &iters {
+    if it.parent.is_empty() {
+      branches |= 1 << it.branch;
+    }
+  }
+  let mut meta = RecipeMeta {
+    iterators: iters
+      .iter()
+      .map(|i| IterMeta { parent: i.parent.clone(), branch: i.branch, slot_hold: false, position_hold: false })
+      .collect(),
+    root: false,
+    branches,
+    root_slot_hold: false,
+    root_position_hold: false,
+    input_count: node.hook("input").map(|h| h.body.len() as u32).unwrap_or(0),
+    branch_counts: [0; 3],
+  };
+
+  for hook in ["input", "output"] {
+    let Some(h) = node.hook(hook) else { continue };
+    for stmt in &h.body {
+      let Stmt::Instr(toks) = stmt else { continue };
+      // anchor + arity: scan every slot/value path's triples.
+      for tok in toks {
+        if let Token::Slot(p) | Token::Value(p) = tok {
+          if p == "root" || p.starts_with("root.") {
+            meta.root = true;
+          }
+          // top-level branch arity from each `slot.<b>.<o>` triple.
+          let segs: Vec<&str> = p.split('.').collect();
+          if segs.first() == Some(&"slot") && segs.len() >= 3 {
+            if let (Ok(b), Ok(o)) = (segs[1].parse::<usize>(), segs[2].parse::<u8>()) {
+              if b < 3 {
+                meta.branch_counts[b] = meta.branch_counts[b].max(o + 1);
+              }
+            }
+          }
+        }
+      }
+      // hold policy: the `&<target> <verb>` write at the tail.
+      let Some(Token::Word(verb)) = toks.last() else { continue };
+      let Some((slot, pos)) = verb_holds(verb) else { continue };
+      let Some(target) = toks.iter().rev().find_map(|t| match t {
+        Token::Slot(p) => Some(p.clone()),
+        _ => None,
+      }) else {
+        continue;
+      };
+      if target == "root" || target.starts_with("root.") {
+        meta.root_slot_hold |= slot;
+        meta.root_position_hold |= pos;
+      } else if let Some((parent, branch)) = path_iter(&target) {
+        if let Some(im) = meta.iterators.iter_mut().find(|im| im.parent == parent && im.branch == branch) {
+          im.slot_hold |= slot;
+          im.position_hold |= pos;
+        }
+      }
+    }
+  }
+  Some(meta)
+}
+
+/// A blueprint catalog entry, resolved from the `<blueprint>` bucket.
+#[derive(Serialize, Clone, Debug, Default, PartialEq)]
+pub struct BlueprintInfo {
+  /// Bundle blueprint id (the discovery-bit index + wire id).
+  pub id: u16,
+  /// Blueprint registry key (e.g. `"nd_furnace"`).
+  pub key: String,
+  /// The blueprint *card* spawned on request, + its packed def.
+  pub blueprint_card: String,
+  pub blueprint_packed: u16,
+  /// The card it builds in-world, + its packed def.
+  pub output_card: String,
+  pub output_packed: u16,
+}
+
+/// Resolve a blueprint by Bundle id. `None` if unknown.
+pub fn blueprint_info(bundle: &Bundle, id: u16) -> Option<BlueprintInfo> {
+  let key = bundle.blueprint_name(id)?.to_string();
+  let blueprint_card = bundle.blueprint_card(&key)?;
+  let output_card = bundle.blueprint_output(&key)?;
+  Some(BlueprintInfo {
+    id,
+    blueprint_packed: bundle.packed_def(&blueprint_card).unwrap_or(0),
+    output_packed: bundle.packed_def(&output_card).unwrap_or(0),
+    blueprint_card,
+    output_card,
+    key,
+  })
+}
+
+/// Every blueprint in id order — the wrench-panel catalog.
+pub fn all_blueprints(bundle: &Bundle) -> Vec<BlueprintInfo> {
+  (1..=bundle.blueprint_ids.len() as u16).filter_map(|id| blueprint_info(bundle, id)).collect()
+}
+
+fn sym(c: Option<&Cell>) -> Option<String> {
+  match c {
+    Some(Cell::Sym(s)) => Some(s.clone()),
+    _ => None,
+  }
+}
+
+fn strip<'a>(s: &'a str, p: &str) -> &'a str {
+  s.strip_prefix(p).unwrap_or(s)
+}
+
+/// Run a card facet's `@define` into a fresh [`Store`].
+fn facet_store(bundle: &Bundle, card: &str, facet: &str) -> Store {
+  let mut s = Store::default();
+  if let Some(define) = bundle.card(card).and_then(|c| c.facet(facet)).and_then(|f| f.hook("define")) {
+    let _ = run(&define.body, &mut s, &[], &bundle.catalog, &bundle.functions);
+  }
+  s
+}
+
+/// Build the [`CardRenderDef`] for a packed `[type:u4 | def_id:u12]`. `None` if
+/// the packed def is unknown.
+pub fn card_render_def(bundle: &Bundle, packed: u16) -> Option<CardRenderDef> {
+  let name = bundle.name_for_packed(packed)?.to_string();
+  let data = facet_store(bundle, &name, "data");
+  let vis = facet_store(bundle, &name, "visuals");
+
+  // visuals
+  let shape = sym(vis.read("shape"))
+    .map(|s| strip(&s, "shape.").to_string())
+    .unwrap_or_else(|| {
+      let nibble = bundle.card_type(&name).as_deref().and_then(crate::loader::type_nibble);
+      if nibble.map(crate::inspect::is_hex_type).unwrap_or(false) { "hex".into() } else { "rect".into() }
+    });
+  let color = |k: &str| vis.read(k).map(Cell::as_int).unwrap_or(0);
+  let objects = match vis.read("objects") {
+    Some(Cell::Arr(v)) => v.iter().filter_map(|c| match c {
+      Cell::Sym(s) => Some(strip(s, "asset::").to_string()),
+      _ => None,
+    }).collect(),
+    _ => Vec::new(),
+  };
+  let texture = sym(vis.read("texture")).map(|s| strip(&s, "asset::").to_string());
+
+  // Row-mutable stock slots. A stock-backed aspect is represented ONLY here —
+  // never also as a static aspect — so a renderer reads its live per-row count
+  // from the slot, not the meaningless static `0` the `stock` verb seeds (the
+  // per-tile value is filled by @init at worldgen and stored in the zone /
+  // tile-card, not the static def).
+  let stock: Vec<StockSlot> = crate::bridge::stock_schema(bundle, &name)
+    .into_iter()
+    .map(|(aspect, max)| {
+      let default = data.read(&format!("aspect.{aspect}")).map(Cell::as_int).unwrap_or(0);
+      StockSlot { aspect, max, default }
+    })
+    .collect();
+  let is_stock = |k: &str| stock.iter().any(|s| s.aspect == k);
+
+  // data: static aspects (numeric `aspect.*` entries, excluding `type` and any
+  // stock-backed aspect — those live in `stock`, where the live value is read).
+  let aspects = match data.read("aspect") {
+    Some(Cell::Map(m)) => m.iter().filter_map(|(k, c)| {
+      if is_stock(k) {
+        return None;
+      }
+      match c {
+        Cell::Int(n) => Some((k.clone(), *n)),
+        Cell::Ranged { val, .. } => Some((k.clone(), *val)),
+        _ => None,
+      }
+    }).collect(),
+    _ => Vec::new(),
+  };
+
+  let lifecycle_recipe = sym(data.read("magnetic.recipe")).map(|s| strip(&s, "recipe::").to_string());
+  let lifecycle_duration_ms = data.read("magnetic.duration").map(|c| c.as_int() as u64);
+
+  Some(CardRenderDef {
+    card_type: bundle.card_type(&name).as_deref().and_then(crate::loader::type_nibble).unwrap_or(0),
+    def_id: bundle.type_def_id(&name).unwrap_or(0),
+    type_name: sym(data.read("aspect.type")).unwrap_or_default(),
+    key: name,
+    shape,
+    color_bg: color("color.bg"),
+    color_title: color("color.title"),
+    color_text: color("color.text"),
+    texture,
+    objects,
+    aspects,
+    stock,
+    lifecycle_recipe,
+    lifecycle_duration_ms,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Visual primitives — the DSL `:visuals` PrimList the client reconciler draws.
+// ---------------------------------------------------------------------------
+
+/// One reconcilable primitive emitted by `:visuals` (`&prims.<i>`). Mirrors the
+/// client `VisualNode`. Numeric fields are floats (the VM now supports them);
+/// `tint` is an `0xRRGGBB` color int; `texture` is an asset name; `text` is a
+/// LOCALE KEY (the client resolves it — definitions never decode locales).
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct PrimNode {
+  pub kind: String,
+  pub pos: Vec2f,
+  pub size: Vec2f,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub anchor: Option<Vec2f>,
+  pub scale: f64,
+  pub rot: f64,
+  pub alpha: f64,
+  pub tint: i64,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub texture: Option<String>,
+  /// Variant index pinned from an `asset::pack:variant` texture (e.g.
+  /// `requisite:axe` → 7). `None` → the client picks a variant by seed (tile
+  /// objects). Lets the generic path render a SPECIFIC icon, not a random one.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub index: Option<i64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub text: Option<String>,
+}
+
+/// Run one facet hook into the (shared) store, if present.
+fn run_into(bundle: &Bundle, card: &str, facet: &str, hook: &str, host: &[(String, Cell)], s: &mut Store) {
+  if let Some(h) = bundle.card(card).and_then(|c| c.facet(facet)).and_then(|f| f.hook(hook)) {
+    let _ = run(&h.body, s, host, &bundle.catalog, &bundle.functions);
+  }
+}
+
+fn map_get<'a>(m: &'a [(String, Cell)], k: &str) -> Option<&'a Cell> {
+  m.iter().find(|(kk, _)| kk == k).map(|(_, c)| c)
+}
+
+fn vec2_field(m: &[(String, Cell)], k: &str) -> Option<Vec2f> {
+  match map_get(m, k) {
+    Some(Cell::Map(mm)) => Some(Vec2f {
+      x: map_get(mm, "x").map(Cell::as_f64).unwrap_or(0.0),
+      y: map_get(mm, "y").map(Cell::as_f64).unwrap_or(0.0),
+    }),
+    _ => None,
+  }
+}
+
+/// Convert one `prims` entry (`Cell::Map`) into a [`PrimNode`]. `None` if it
+/// isn't a map or has no `kind`. Texture + index are resolved IN THE DSL (the
+/// `:visuals` hook derefs `*pack.object` / `*pack.texture.<variant>`); this just
+/// reads the fields the prim carries.
+fn prim_from_cell(c: &Cell) -> Option<PrimNode> {
+  let Cell::Map(m) = c else { return None };
+  // `kind` is the symbol pushed by the `^hex`/`^rect`/`^sprite`/`^text` engine
+  // intrinsic (`vm::PRIM_KINDS`) — already the bare kind, no prefix to strip.
+  let kind = match map_get(m, "kind") {
+    Some(Cell::Sym(s)) => s.clone(),
+    _ => return None,
+  };
+  let f = |k: &str, dflt: f64| map_get(m, k).map(Cell::as_f64).unwrap_or(dflt);
+  // texture: an object name the DSL already resolved (`*pack.object` →
+  // `manifest::requisite`, or `*rec.art.object`); strip the namespace prefix to
+  // the bare folder the client LOD keys on.
+  let texture = match map_get(m, "texture") {
+    Some(Cell::Sym(s)) => Some(strip(strip(s, "asset::"), "manifest::").to_string()),
+    _ => None,
+  };
+  // index: the variant pinned in the DSL (`*pack.texture.<variant>`); unset →
+  // the client picks a variant by seed (tile objects).
+  let index = map_get(m, "index").map(Cell::as_int);
+  Some(PrimNode {
+    kind,
+    pos: vec2_field(m, "pos").unwrap_or_default(),
+    size: vec2_field(m, "size").unwrap_or_default(),
+    anchor: vec2_field(m, "anchor"),
+    scale: f("scale", 1.0),
+    rot: f("rot", 0.0),
+    alpha: f("alpha", 1.0),
+    tint: map_get(m, "tint").map(Cell::as_int).unwrap_or(0xff_ffff),
+    texture,
+    index,
+    // `text` is a locale key — kept verbatim (client resolves via locales).
+    text: match map_get(m, "text") {
+      Some(Cell::Sym(s)) => Some(s.clone()),
+      _ => None,
+    },
+  })
+}
+
+/// Run a card's `:visuals` hook against `host` and return its `&prims` list — the
+/// client's reconcilable visual spec. Runs `:data` (`@define`+`@init`) then
+/// `:visuals` (`@define`+`hook`) into one store, so a visual hook can read the
+/// card's data aspects + static colours. `hook` is `"init"` (first draw, client
+/// snaps current=target) or `"update"` (client eases to the new targets).
+pub fn draw_visuals(bundle: &Bundle, packed: u16, host: &[(String, Cell)], hook: &str) -> Vec<PrimNode> {
+  let Some(name) = bundle.name_for_packed(packed).map(str::to_string) else {
+    return Vec::new();
+  };
+  let mut s = Store::default();
+  run_into(bundle, &name, "data", "define", &[], &mut s);
+  run_into(bundle, &name, "data", "init", host, &mut s);
+  run_into(bundle, &name, "visuals", "define", &[], &mut s);
+  run_into(bundle, &name, "visuals", hook, host, &mut s);
+  match s.read("prims") {
+    Some(Cell::Arr(v)) => v.iter().filter_map(prim_from_cell).collect(),
+    _ => Vec::new(),
+  }
+}
+
+/// Render a world tile through `:visuals` → `PrimList`, with the **stored** stock
+/// overlaid (not recomputed from biome — the client has no world seed, and a
+/// harvested tile's stock differs from its biome default). `stock` is the tile's
+/// per-slot counts (positional, by `stock_schema`). Raw aspects are NOT folded
+/// here (unlike `card_view`) — `ring_prims` pulls each aspect's own sprite, so
+/// `pine` stays `pine`, not rolled up to `wood`. The LOD variant + faction are
+/// chosen client-side (the sprite's `texture` is the bare object name), so no
+/// host is needed.
+pub fn tile_prims(bundle: &Bundle, packed: u16, stock: &[i64]) -> Vec<PrimNode> {
+  let Some(name) = bundle.name_for_packed(packed).map(str::to_string) else {
+    return Vec::new();
+  };
+  let mut s = Store::default();
+  run_into(bundle, &name, "data", "define", &[], &mut s);
+  for (i, (aspect, _)) in crate::bridge::stock_schema(bundle, &name).iter().enumerate() {
+    if let Some(v) = stock.get(i) {
+      s.write(&format!("aspect.{aspect}"), Cell::Int(*v));
+    }
+  }
+  run_into(bundle, &name, "visuals", "define", &[], &mut s);
+  run_into(bundle, &name, "visuals", "init", &[], &mut s);
+  match s.read("prims") {
+    Some(Cell::Arr(v)) => v.iter().filter_map(prim_from_cell).collect(),
+    _ => Vec::new(),
+  }
+}
+
+/// The `<aspect>` record for `name`, resolving inherited `icon`/`color` up the
+/// `satisfies` chain (first satisfied aspect wins). `None` if unknown.
+pub fn aspect_info(bundle: &Bundle, name: &str) -> Option<AspectInfo> {
+  let cell = bundle.catalog.aspect(name)?;
+  let field = |k: &str| match cell {
+    Cell::Map(m) => m.iter().find(|(kk, _)| kk == k).map(|(_, v)| v),
+    _ => None,
+  };
+  let satisfies: Vec<String> = match field("satisfies") {
+    Some(Cell::Arr(v)) => v.iter().filter_map(|c| match c {
+      Cell::Sym(s) => Some(strip(s, "aspect::").to_string()),
+      _ => None,
+    }).collect(),
+    _ => Vec::new(),
+  };
+  // icon/color inherit from the first satisfied aspect when omitted (bounded
+  // walk up the satisfies chain). Returns the resolved cell so the caller
+  // extracts a Sym (icon) or Int (color) as appropriate.
+  let inherited = |key: &str| -> Option<Cell> {
+    if let Some(v) = field(key) {
+      return Some(v.clone());
+    }
+    let mut cur = satisfies.first().cloned();
+    for _ in 0..8 {
+      let parent = cur?;
+      let Some(Cell::Map(m)) = bundle.catalog.aspect(&parent) else { break };
+      if let Some(v) = m.iter().find(|(k, _)| k == key).map(|(_, v)| v) {
+        return Some(v.clone());
+      }
+      cur = m.iter().find(|(k, _)| k == "satisfies").and_then(|(_, v)| match v {
+        Cell::Arr(a) => a.first().and_then(|c| match c {
+          Cell::Sym(s) => Some(strip(s, "aspect::").to_string()),
+          _ => None,
+        }),
+        _ => None,
+      });
+    }
+    None
+  };
+  Some(AspectInfo {
+    name: name.to_string(),
+    icon: inherited("icon").and_then(|c| match c { Cell::Sym(s) => Some(s), _ => None }).unwrap_or_default(),
+    color: inherited("color").map(|c| c.as_int()).unwrap_or(0),
+    section: sym(field("section")).unwrap_or_default(),
+    satisfies,
+    art: sym(field("art")).map(|s| strip(&s, "asset::").to_string()),
+  })
+}
+
+/// The folded value of a named aspect on a packed card def — the static aspect
+/// rolled up the `satisfies` hierarchy (what a recipe predicate reads). `None`
+/// when the def doesn't carry the aspect at all; `Some(0)` when it carries the
+/// aspect with value 0. Callers rely on that distinction (e.g. "has an
+/// inventory" vs "infinite-capacity inventory"), so don't `unwrap_or(0)` here —
+/// that collapses absent into `Some(0)`, making every card look like it carries
+/// every aspect.
+pub fn aspect_value(bundle: &Bundle, packed: u16, name: &str) -> Option<i64> {
+  // Resolve packed → name → GLOBAL card def_id. `card_view`/`card_name` index a
+  // global card list, so feeding the raw `unpack_def(packed).1` (the TYPE-LOCAL
+  // 12-bit def_id) resolves the wrong card — it only happened to work when a
+  // card's type-local id equalled its global index (true in tiny test bundles,
+  // false in the real corpus, where it silently read a different card's
+  // aspects). `name_for_packed` keys the full packed value, matching
+  // `card_render_def`.
+  let def_id = bundle.card_def_id(bundle.name_for_packed(packed)?)?;
+  let view = crate::bridge::card_view(bundle, &crate::bridge::Card { def_id, stock: Vec::new() });
+  Store::with_root(view).read(&format!("aspect.{name}")).map(Cell::as_int)
+}
+
+// ---------- Tests ----------
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::loader::load;
+
+  fn bundle() -> Bundle {
+    let assets = "<asset>\n  ::pine>\n    @define>\n      256 &size set\n  ::log>\n    @define>\n      128 &size set\n";
+    let aspects = "<aspect>\n\
+      \x20 ::wood>\n    @define>\n      aspects &section set\n      tree &icon set\n      #6B4423 &color set\n\
+      \x20 ::pine>\n    @define>\n      aspects &section set\n      1 &satisfies array\n      $aspect::wood &satisfies.0 set\n      $asset::pine &art set\n\
+      \x20 ::type>\n    @define>\n      traits &section set\n\
+      \x20 ::cost>\n    @define>\n      traits &section set\n";
+    let cards = "<card>\n\
+      \x20 ::log>\n    :data>\n      @define>\n        requisite &aspect.type set\n        2 &aspect.wood set\n    :visuals>\n      @define>\n        $shape.rect &shape set\n        #8B5E3C &color.bg set\n        #ecd6aa &color.title set\n        #0b1426 &color.text set\n        1 &objects array\n        $asset::log &objects.0 set\n\
+      \x20 ::forest>\n    :data>\n      @define>\n        2 &aspect.pine stock\n        tile &aspect.type set\n        30 &aspect.cost set\n    :visuals>\n      @define>\n        $shape.hex &shape set\n        #0b1426 &color.bg set\n        #0b1426 &color.title set\n        #0b1426 &color.text set\n";
+    load(&[("s.rd".into(), assets.into()), ("a.rd".into(), aspects.into()), ("c.rd".into(), cards.into())]).expect("load")
+  }
+
+  #[test]
+  fn draw_visuals_builds_prim_list() {
+    // :visuals @init builds one rect primitive via the `^rect` handle, tinted
+    // from a value @define set — exercises the prim constructor + Ref handle
+    // (`&h.field` writes through to the pushed prim) + float coords.
+    let aspects = "<aspect>\n  ::type>\n    @define>\n      traits &section set\n";
+    let cards = "<card>\n  ::panel>\n    :data>\n      @define>\n        requisite &aspect.type set\n    :visuals>\n      @define>\n        #112233 &bg set\n      @init>\n        ^rect call &h set\n        0 0 &h.pos vec2\n        100 50.5 &h.size vec2\n        50 50 &h.anchor vec2\n        *bg &h.tint set\n";
+    let b = load(&[("a.rd".into(), aspects.into()), ("c.rd".into(), cards.into())]).expect("load");
+    let prims = draw_visuals(&b, b.packed_def("panel").unwrap(), &[], "init");
+    assert_eq!(prims.len(), 1);
+    let p = &prims[0];
+    assert_eq!(p.kind, "rect");
+    assert_eq!(p.size, Vec2f { x: 100.0, y: 50.5 });
+    assert_eq!(p.anchor, Some(Vec2f { x: 50.0, y: 50.0 }));
+    assert_eq!(p.tint, 0x112233);
+    assert_eq!(p.scale, 1.0); // default
+    assert_eq!(p.alpha, 1.0); // default
+  }
+
+  #[test]
+  fn dsl_resolves_asset_variant_to_texture_index() {
+    // The CARD resolves its art in the DSL (no engine `resolve_texture`): the
+    // pack ref derefs `*pack.object` → the manifest folder and `*pack.texture.axe`
+    // → the variant index (7). `prim_from_cell` just reads the fields.
+    let manifest = "<manifest>\n  ::requisite>\n    :neutral>\n      @define>\n        1 &texture array\n        a.png &texture.0 set\n";
+    let assets = "<asset>\n  ::requisite>\n    @define>\n      $manifest::requisite &object set\n      128 &size set\n      7 &texture.axe set\n";
+    let aspects = "<aspect>\n  ::type>\n    @define>\n      traits &section set\n";
+    let cards = "<card>\n  ::axe>\n    :data>\n      @define>\n        requisite &aspect.type set\n    :visuals>\n      @init>\n        $asset::requisite &pack set\n        ^sprite call &h set\n        *pack.object &h.texture set\n        *pack.texture.axe &h.index set\n";
+    let b = load(&[
+      ("m.rd".into(), manifest.into()),
+      ("s.rd".into(), assets.into()),
+      ("a.rd".into(), aspects.into()),
+      ("c.rd".into(), cards.into()),
+    ])
+    .expect("load");
+    let prims = draw_visuals(&b, b.packed_def("axe").unwrap(), &[], "init");
+    assert_eq!(prims.len(), 1);
+    assert_eq!(prims[0].kind, "sprite");
+    assert_eq!(prims[0].texture.as_deref(), Some("requisite"));
+    assert_eq!(prims[0].index, Some(7));
+  }
+
+  #[test]
+  fn render_def_extracts_visuals_and_data() {
+    let b = bundle();
+    let d = card_render_def(&b, b.packed_def("log").unwrap()).unwrap();
+    assert_eq!(d.key, "log");
+    assert_eq!(d.type_name, "requisite");
+    assert_eq!(d.shape, "rect");
+    assert_eq!(d.color_bg, 0x8B5E3C);
+    assert_eq!(d.color_title, 0xecd6aa);
+    assert_eq!(d.objects, vec!["log".to_string()]);
+    // static aspect `wood = 2` present (type symbol excluded)
+    assert!(d.aspects.iter().any(|(k, v)| k == "wood" && *v == 2));
+    assert!(!d.aspects.iter().any(|(k, _)| k == "type"));
+  }
+
+  #[test]
+  fn render_def_stock_and_shape_for_tile() {
+    let b = bundle();
+    let d = card_render_def(&b, b.packed_def("forest").unwrap()).unwrap();
+    assert_eq!(d.shape, "hex");
+    // forest declares a `pine` stock slot (bits 2)
+    assert_eq!(d.stock.len(), 1);
+    assert_eq!(d.stock[0].aspect, "pine");
+    // ...and a stock-backed aspect must NOT also appear as a static aspect
+    // (else a renderer reads its static `0` default and masks the live stock).
+    assert!(!d.aspects.iter().any(|(k, _)| k == "pine"));
+  }
+
+  #[test]
+  fn aspect_info_inherits_icon_and_color() {
+    let b = bundle();
+    let wood = aspect_info(&b, "wood").unwrap();
+    assert_eq!(wood.icon, "tree");
+    assert_eq!(wood.color, 0x6B4423);
+    assert_eq!(wood.section, "aspects");
+    // pine omits icon/color → inherits wood's via satisfies
+    let pine = aspect_info(&b, "pine").unwrap();
+    assert_eq!(pine.satisfies, vec!["wood".to_string()]);
+    assert_eq!(pine.icon, "tree");
+    assert_eq!(pine.color, 0x6B4423);
+    assert_eq!(pine.art.as_deref(), Some("pine"));
+  }
+
+  #[test]
+  fn recipe_meta_iterators_and_anchors() {
+    let aspects = "<aspect>\n  ::type>\n    @define>\n      traits &section set\n  ::cost>\n    @define>\n      traits &section set\n";
+    let cards = "<card>\n  ::corpus>\n    :data>\n      @define>\n        faculty &aspect.type set\n        1 &aspect.cost set\n";
+    let recipes = "<recipe>\n\
+      \x20 ::triple>\n    @input>\n      $card::corpus *slot.1.0.def_id eq if &slot.1.0 use\n      $card::corpus *slot.1.1.def_id eq if &slot.1.1 use\n    @output>\n      &slot.1.0 destroy\n\
+      \x20 ::rooted>\n    @input>\n      *root.aspect.cost 1 ge if &root use\n    @output>\n      &root destroy\n";
+    let b = load(&[("a.rd".into(), aspects.into()), ("c.rd".into(), cards.into()), ("r.rd".into(), recipes.into())]).unwrap();
+    let m = recipe_meta(&b, "triple").unwrap();
+    assert_eq!(m.iterators.len(), 1);
+    assert_eq!(m.iterators[0].branch, 1);
+    assert_eq!(m.iterators[0].parent, "");
+    assert_eq!(m.branches, 1 << 1);
+    assert!(!m.root);
+    assert!(recipe_meta(&b, "rooted").unwrap().root);
+  }
+
+  #[test]
+  fn aspect_value_folds_satisfies() {
+    // `pine` satisfies `wood`; a card that statically sets `pine = 2` folds to
+    // `wood = 2` through `card_view`'s satisfies roll-up. (The old version of
+    // this test used `forest`, whose `pine` is a *stock* slot seeded to 0
+    // statically — so nothing folded; it only appeared to pass because the
+    // buggy packed→def_id resolution read a *different* card's `wood`.)
+    let aspects = "<aspect>\n\
+      \x20 ::wood>\n    @define>\n      aspects &section set\n\
+      \x20 ::pine>\n    @define>\n      aspects &section set\n      1 &satisfies array\n      $aspect::wood &satisfies.0 set\n\
+      \x20 ::type>\n    @define>\n      traits &section set\n";
+    let cards = "<card>\n\
+      \x20 ::twig>\n    :data>\n      @define>\n        requisite &aspect.type set\n        2 &aspect.pine set\n    :visuals>\n      @define>\n        $shape.rect &shape set\n";
+    let b = load(&[("a.rd".into(), aspects.into()), ("c.rd".into(), cards.into())]).expect("load");
+    let twig = b.packed_def("twig").unwrap();
+    assert_eq!(aspect_value(&b, twig, "pine"), Some(2));
+    assert_eq!(aspect_value(&b, twig, "wood"), Some(2)); // folded up `satisfies`
+    // An aspect the def doesn't carry resolves to `None`, NOT `Some(0)` — the
+    // client gate (`aspectValue !== null`) depends on this to tell "no
+    // inventory" from "infinite-capacity inventory".
+    assert_eq!(aspect_value(&b, twig, "definitely_not_an_aspect"), None);
+  }
+
+  #[test]
+  fn aspect_value_resolves_packed_not_typelocal_id() {
+    // Regression: a bundle where the inventory-bearing card's TYPE-LOCAL def_id
+    // (1 — first `soul`) differs from its GLOBAL card index (3 — after two
+    // `requisite`s). The old resolution fed `unpack_def(packed).1` straight to
+    // `card_view`, which indexes the GLOBAL card list, so it read global card #1
+    // (a requisite, no inventory) and returned `None` for the soul. The tiny
+    // single-type test bundles masked this because type-local == global there.
+    let aspects = "<aspect>\n\
+      \x20 ::type>\n    @define>\n      traits &section set\n\
+      \x20 ::inventory>\n    @define>\n      features &section set\n";
+    let cards = "<card>\n\
+      \x20 ::ra>\n    :data>\n      @define>\n        requisite &aspect.type set\n    :visuals>\n      @define>\n        $shape.rect &shape set\n\
+      \x20 ::rb>\n    :data>\n      @define>\n        requisite &aspect.type set\n    :visuals>\n      @define>\n        $shape.rect &shape set\n\
+      \x20 ::hero>\n    :data>\n      @define>\n        soul &aspect.type set\n        1 &aspect.inventory set\n    :visuals>\n      @define>\n        $shape.rect &shape set\n";
+    let b = load(&[("a.rd".into(), aspects.into()), ("c.rd".into(), cards.into())]).expect("load");
+    let hero = b.packed_def("hero").unwrap();
+    // The mismatch the bug needs: type-local def_id 1, global index 3.
+    assert_eq!(crate::bits::unpack_def(hero).1, 1);
+    assert_eq!(b.card_def_id("hero"), Some(3));
+    assert_eq!(aspect_value(&b, hero, "inventory"), Some(1));
+    // A requisite that doesn't declare inventory still resolves to `None` — not
+    // the soul's value, and not a stale read of the wrong card.
+    let ra = b.packed_def("ra").unwrap();
+    assert_eq!(aspect_value(&b, ra, "inventory"), None);
+  }
+}
