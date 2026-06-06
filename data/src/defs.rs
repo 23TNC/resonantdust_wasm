@@ -426,6 +426,26 @@ pub struct PrimNode {
   pub index: Option<i64>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub text: Option<String>,
+  /// `progress` primitive: the row to TRACK (an index into the card's progress
+  /// list, `*d.progress.<i>.id`). The client resolves it to the row's timing and
+  /// fills the bar live — the DSL doesn't compute the fraction.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub target: Option<i64>,
+  /// `progress` primitive: the bar style (`*d.progress.<i>.style`; 1 = ltr,
+  /// 2 = rtl). DSL-chosen.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub style: Option<i64>,
+  /// Paint order WITHIN the card (`&h.z set`). Higher draws on top. `None` → the
+  /// client falls back to push order (so `title`, pushed last, stays on top
+  /// without anyone setting `z`). Independent of the card's z in its stack —
+  /// that's the container's `stackZ` (nested sorts compose).
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub z: Option<i64>,
+  /// `progress` primitive: which fraction SOURCE the client fills from. `None`/0
+  /// = a progress row (`target` indexes `card_data.progress`); 1 = the action
+  /// QUEUE/debounce fraction (the pre-propose bar). The DSL picks it (`&h.source`).
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub source: Option<i64>,
 }
 
 /// Run one facet hook into the (shared) store, if present.
@@ -488,6 +508,13 @@ fn prim_from_cell(c: &Cell) -> Option<PrimNode> {
       Some(Cell::Sym(s)) => Some(s.clone()),
       _ => None,
     },
+    // progress: which row to track + the bar style (DSL-set; client fills live).
+    target: map_get(m, "target").map(Cell::as_int),
+    style: map_get(m, "style").map(Cell::as_int),
+    // intra-card paint order (unset → client uses push order).
+    z: map_get(m, "z").map(Cell::as_int),
+    // progress fill source (unset/0 = row, 1 = queue/debounce).
+    source: map_get(m, "source").map(Cell::as_int),
   })
 }
 
@@ -503,6 +530,17 @@ pub fn draw_visuals(bundle: &Bundle, packed: u16, host: &[(String, Cell)], hook:
   let mut s = Store::default();
   run_into(bundle, &name, "data", "define", &[], &mut s);
   run_into(bundle, &name, "data", "init", host, &mut s);
+  // Seed the card's identity so `:visuals` can author locale-keyed text (titles,
+  // and later descriptions) WITHOUT hardcoding the key per card — the engine
+  // hands the DSL the parts (`*sys.type`/`*sys.key`) plus the ready label key
+  // (`*sys.label`). The `cards.<type>.<key>.label` scheme mirrors the client's
+  // `DefinitionManager.label`; the DSL only forwards the key (the client still
+  // resolves the string — definitions never decode locales). The data hook ran
+  // first, so `aspect.type` is set.
+  let type_name = sym(s.read("aspect.type")).unwrap_or_default();
+  s.write("sys.key", Cell::Sym(name.clone()));
+  s.write("sys.type", Cell::Sym(type_name.clone()));
+  s.write("sys.label", Cell::Sym(format!("cards.{type_name}.{name}.label")));
   run_into(bundle, &name, "visuals", "define", &[], &mut s);
   run_into(bundle, &name, "visuals", hook, host, &mut s);
   match s.read("prims") {
@@ -517,12 +555,14 @@ pub fn draw_visuals(bundle: &Bundle, packed: u16, host: &[(String, Cell)], hook:
 /// per-slot counts (positional, by `stock_schema`). Raw aspects are NOT folded
 /// here (unlike `card_view`) — `ring_prims` pulls each aspect's own sprite, so
 /// `pine` stays `pine`, not rolled up to `wood`. The LOD variant + faction are
-/// chosen client-side (the sprite's `texture` is the bare object name), so no
-/// host is needed.
-pub fn tile_prims(bundle: &Bundle, packed: u16, stock: &[i64]) -> Vec<PrimNode> {
+/// chosen client-side (the sprite's `texture` is the bare object name). `seed`
+/// is the tile's `(q,r)` hash, exposed to `:visuals` as `^seed` so the scatter
+/// (ring-slot angles, per-object scale) is deterministic per tile.
+pub fn tile_prims(bundle: &Bundle, packed: u16, stock: &[i64], seed: i64) -> Vec<PrimNode> {
   let Some(name) = bundle.name_for_packed(packed).map(str::to_string) else {
     return Vec::new();
   };
+  let host = [("seed".to_string(), Cell::Int(seed))];
   let mut s = Store::default();
   run_into(bundle, &name, "data", "define", &[], &mut s);
   for (i, (aspect, _)) in crate::bridge::stock_schema(bundle, &name).iter().enumerate() {
@@ -531,7 +571,7 @@ pub fn tile_prims(bundle: &Bundle, packed: u16, stock: &[i64]) -> Vec<PrimNode> 
     }
   }
   run_into(bundle, &name, "visuals", "define", &[], &mut s);
-  run_into(bundle, &name, "visuals", "init", &[], &mut s);
+  run_into(bundle, &name, "visuals", "init", &host, &mut s);
   match s.read("prims") {
     Some(Cell::Arr(v)) => v.iter().filter_map(prim_from_cell).collect(),
     _ => Vec::new(),
@@ -647,6 +687,113 @@ mod tests {
   }
 
   #[test]
+  fn card_data_host_drives_prims() {
+    // `^card_data` is a structured host record (avoids big-int fields): the DSL
+    // reads NESTED fields (`*d.stack.index`, `*d.progress.0`) to drive prims —
+    // the hook for DSL-side stack positioning / progress bars / overlays.
+    let aspects = "<aspect>\n  ::type>\n    @define>\n      traits &section set\n";
+    let cards = "<card>\n  ::c>\n    :data>\n      @define>\n        requisite &aspect.type set\n    :visuals>\n      @init>\n        ^card_data call &d set\n        ^rect call &h set\n        *d.stack.index &h.tint set\n        *d.progress.0 &h.rot set\n";
+    let b = load(&[("a.rd".into(), aspects.into()), ("c.rd".into(), cards.into())]).expect("load");
+    let host = vec![(
+      "card_data".to_string(),
+      Cell::Map(vec![
+        ("stack".into(), Cell::Map(vec![("index".into(), Cell::Int(3))])),
+        ("progress".into(), Cell::Arr(vec![Cell::Int(42)])),
+      ]),
+    )];
+    let prims = draw_visuals(&b, b.packed_def("c").unwrap(), &host, "init");
+    assert_eq!(prims.len(), 1);
+    assert_eq!(prims[0].tint, 3); // from *d.stack.index
+    assert_eq!(prims[0].rot, 42.0); // from *d.progress.0
+  }
+
+  #[test]
+  fn card_data_stack_index_fans_prim_y() {
+    // The generic stack fan lives in the DSL: a stacked card sits at its chain
+    // root (engine-placed); its prims shift y by `index · dir · step`. Verifies
+    // the arithmetic + nested `^card_data` reads + that a `vec2` takes a computed
+    // y. (step is a literal here; the real builders use `$globals::title_height`.)
+    let aspects = "<aspect>\n  ::type>\n    @define>\n      traits &section set\n";
+    let cards = "<card>\n  ::c>\n    :data>\n      @define>\n        requisite &aspect.type set\n    :visuals>\n      @init>\n        ^card_data call &d set\n        *d.stack.index *d.stack.dir mul 10 mul &stack_dy set\n        ^rect call &h set\n        0.0 0.0 *stack_dy add &h.pos vec2\n";
+    let b = load(&[("a.rd".into(), aspects.into()), ("c.rd".into(), cards.into())]).expect("load");
+    let host = vec![(
+      "card_data".to_string(),
+      Cell::Map(vec![(
+        "stack".into(),
+        Cell::Map(vec![("index".into(), Cell::Int(2)), ("dir".into(), Cell::Int(-1))]),
+      )]),
+    )];
+    let prims = draw_visuals(&b, b.packed_def("c").unwrap(), &host, "init");
+    assert_eq!(prims.len(), 1);
+    assert_eq!(prims[0].pos.y, -20.0); // 2 · -1 · 10
+  }
+
+  #[test]
+  fn destroy_hook_emits_exit_prims() {
+    // `@destroy` is a real `:visuals` hook (parser allows it; `draw_visuals` runs
+    // `visuals/<hook>`). The client runs it when a row goes `dead === 1` and eases
+    // the prims to these EXIT targets before removing the card. Here the exit fades
+    // the rect to alpha 0; a card with no `@destroy` would yield an empty list.
+    let aspects = "<aspect>\n  ::type>\n    @define>\n      traits &section set\n";
+    let cards = "<card>\n  ::c>\n    :data>\n      @define>\n        requisite &aspect.type set\n    :visuals>\n      @init>\n        ^rect call &h set\n      @destroy>\n        ^rect call &h set\n        0.0 &h.alpha set\n";
+    let b = load(&[("a.rd".into(), aspects.into()), ("c.rd".into(), cards.into())]).expect("load");
+    let alive = draw_visuals(&b, b.packed_def("c").unwrap(), &[], "init");
+    assert_eq!(alive.len(), 1);
+    assert_eq!(alive[0].alpha, 1.0);
+    let exit = draw_visuals(&b, b.packed_def("c").unwrap(), &[], "destroy");
+    assert_eq!(exit.len(), 1);
+    assert_eq!(exit[0].alpha, 0.0);
+  }
+
+  #[test]
+  fn prim_z_carries_intra_card_paint_order() {
+    // `&h.z set` rides through to the prim so the client can sort intra-card paint
+    // order (text over art, …); unset → None (client falls back to push order).
+    let aspects = "<aspect>\n  ::type>\n    @define>\n      traits &section set\n";
+    let cards = "<card>\n  ::c>\n    :data>\n      @define>\n        requisite &aspect.type set\n    :visuals>\n      @init>\n        ^rect call &h set\n        ^text call &h set\n        9 &h.z set\n";
+    let b = load(&[("a.rd".into(), aspects.into()), ("c.rd".into(), cards.into())]).expect("load");
+    let prims = draw_visuals(&b, b.packed_def("c").unwrap(), &[], "init");
+    assert_eq!(prims.len(), 2);
+    assert_eq!(prims[0].z, None); // unset
+    assert_eq!(prims[1].z, Some(9)); // the text
+  }
+
+  #[test]
+  fn progress_prim_carries_target_and_style() {
+    // `^progress call &h set` + `*d.progress.0.id &h.target set` /
+    // `*d.progress.0.style &h.style set` → a progress prim carrying the row to
+    // TRACK + the style. The client fills it live from the row's timing (the DSL
+    // never sets a 0..1 value — it isn't run per-frame).
+    let aspects = "<aspect>\n  ::type>\n    @define>\n      traits &section set\n";
+    let cards = "<card>\n  ::c>\n    :data>\n      @define>\n        requisite &aspect.type set\n    :visuals>\n      @init>\n        ^card_data call &d set\n        ^progress call &h set\n        *d.progress.0.id &h.target set\n        *d.progress.0.style &h.style set\n";
+    let b = load(&[("a.rd".into(), aspects.into()), ("c.rd".into(), cards.into())]).expect("load");
+    let host = vec![(
+      "card_data".to_string(),
+      Cell::Map(vec![(
+        "progress".into(),
+        Cell::Arr(vec![Cell::Map(vec![("id".into(), Cell::Int(0)), ("style".into(), Cell::Int(2))])]),
+      )]),
+    )];
+    let prims = draw_visuals(&b, b.packed_def("c").unwrap(), &host, "init");
+    assert_eq!(prims.len(), 1);
+    assert_eq!(prims[0].kind, "progress");
+    assert_eq!(prims[0].target, Some(0));
+    assert_eq!(prims[0].style, Some(2));
+  }
+
+  #[test]
+  fn progress_source_selects_queue() {
+    // `&h.source set` picks the fill SOURCE: unset/0 = a progress row, 1 = the
+    // action queue/debounce. The client routes to `deps.queue` for source 1.
+    let aspects = "<aspect>\n  ::type>\n    @define>\n      traits &section set\n";
+    let cards = "<card>\n  ::c>\n    :data>\n      @define>\n        requisite &aspect.type set\n    :visuals>\n      @init>\n        ^progress call &p set\n        1 &p.source set\n";
+    let b = load(&[("a.rd".into(), aspects.into()), ("c.rd".into(), cards.into())]).expect("load");
+    let prims = draw_visuals(&b, b.packed_def("c").unwrap(), &[], "init");
+    assert_eq!(prims.len(), 1);
+    assert_eq!(prims[0].source, Some(1));
+  }
+
+  #[test]
   fn dsl_resolves_asset_variant_to_texture_index() {
     // The CARD resolves its art in the DSL (no engine `resolve_texture`): the
     // pack ref derefs `*pack.object` → the manifest folder and `*pack.texture.axe`
@@ -667,6 +814,20 @@ mod tests {
     assert_eq!(prims[0].kind, "sprite");
     assert_eq!(prims[0].texture.as_deref(), Some("requisite"));
     assert_eq!(prims[0].index, Some(7));
+  }
+
+  #[test]
+  fn sys_label_carries_card_title_key() {
+    // The engine seeds the card's identity before `:visuals` so a shared title
+    // builder can author the label locale KEY without per-card hardcoding:
+    // `*sys.label` → `cards.<type>.<key>.label` (client resolves the string).
+    let aspects = "<aspect>\n  ::type>\n    @define>\n      traits &section set\n";
+    let cards = "<card>\n  ::axe>\n    :data>\n      @define>\n        requisite &aspect.type set\n    :visuals>\n      @init>\n        ^text call &h set\n        *sys.label &h.text set\n";
+    let b = load(&[("a.rd".into(), aspects.into()), ("c.rd".into(), cards.into())]).expect("load");
+    let prims = draw_visuals(&b, b.packed_def("axe").unwrap(), &[], "init");
+    assert_eq!(prims.len(), 1);
+    assert_eq!(prims[0].kind, "text");
+    assert_eq!(prims[0].text.as_deref(), Some("cards.requisite.axe.label"));
   }
 
   #[test]

@@ -69,8 +69,8 @@ impl Content {
     /// Render a world tile to a primitive list from its stored stock (overlaid,
     /// not biome-recomputed). LOD variant + faction are chosen client-side. See
     /// `defs::tile_prims`.
-    pub fn tile_prims(&self, packed: u16, stock: Vec<i64>) -> Vec<defs::PrimNode> {
-        defs::tile_prims(&self.bundle, packed, &stock)
+    pub fn tile_prims(&self, packed: u16, stock: Vec<i64>, seed: i64) -> Vec<defs::PrimNode> {
+        defs::tile_prims(&self.bundle, packed, &stock, seed)
     }
 
     /// Match a recipe's `@input` against an operating-set frame of
@@ -191,27 +191,32 @@ fn jserr<E: std::fmt::Display>(e: E) -> JsValue {
     JsValue::from_str(&e.to_string())
 }
 
-/// Parse a flat JSON object of instance state into VM host bindings. Integral
-/// numbers → `Cell::Int`, fractional → `Cell::Float`, strings → `Cell::Sym`;
-/// other shapes are skipped. (Nested host maps — e.g. biome — aren't needed for
-/// card visuals yet.)
+/// One JSON value → a `Cell`. Recursive, so NESTED host inputs work: an object
+/// becomes a `Cell::Map`, an array a `Cell::Arr` — which is how `^card_data`
+/// hands the DSL a structured record (`*d.stack.index`, `*d.progress.0`, …)
+/// without passing big ints field-by-field. `null` is dropped.
+#[cfg(feature = "js")]
+fn json_to_cell(v: serde_json::Value) -> Option<Cell> {
+    Some(match v {
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => Cell::Int(i),
+            None => Cell::Float(n.as_f64()?),
+        },
+        serde_json::Value::String(s) => Cell::Sym(s),
+        serde_json::Value::Bool(b) => Cell::Int(b as i64),
+        serde_json::Value::Array(a) => Cell::Arr(a.into_iter().filter_map(json_to_cell).collect()),
+        serde_json::Value::Object(m) => {
+            Cell::Map(m.into_iter().filter_map(|(k, v)| json_to_cell(v).map(|c| (k, c))).collect())
+        }
+        serde_json::Value::Null => return None,
+    })
+}
+
 #[cfg(feature = "js")]
 fn parse_host(json: &str) -> Vec<(String, Cell)> {
     let map: serde_json::Map<String, serde_json::Value> =
         serde_json::from_str(json).unwrap_or_default();
-    map.into_iter()
-        .filter_map(|(k, v)| {
-            let cell = match v {
-                serde_json::Value::Number(n) => match n.as_i64() {
-                    Some(i) => Cell::Int(i),
-                    None => Cell::Float(n.as_f64()?),
-                },
-                serde_json::Value::String(s) => Cell::Sym(s),
-                _ => return None,
-            };
-            Some((k, cell))
-        })
-        .collect()
+    map.into_iter().filter_map(|(k, v)| json_to_cell(v).map(|c| (k, c))).collect()
 }
 
 #[cfg(feature = "js")]
@@ -304,11 +309,13 @@ impl Content {
         serde_json::to_string(&self.draw_visuals(packed, parse_host(host_json), hook)).map_err(jserr)
     }
 
-    /// `tilePrims(packed, stock0, stock1)` → the world tile's `PrimList` JSON
-    /// from its stored stock (the two zone stock slots).
+    /// `tilePrims(packed, stock0, stock1, seed)` → the world tile's `PrimList`
+    /// JSON from its stored stock (the two zone stock slots). `seed` is the
+    /// tile's `(q,r)` hash, driving the `:visuals` scatter (ring angles, scale).
     #[wasm_bindgen(js_name = tilePrims)]
-    pub fn tile_prims_js(&self, packed: u16, stock0: i32, stock1: i32) -> Result<String, JsValue> {
-        serde_json::to_string(&self.tile_prims(packed, vec![stock0 as i64, stock1 as i64])).map_err(jserr)
+    pub fn tile_prims_js(&self, packed: u16, stock0: i32, stock1: i32, seed: i32) -> Result<String, JsValue> {
+        serde_json::to_string(&self.tile_prims(packed, vec![stock0 as i64, stock1 as i64], seed as i64))
+            .map_err(jserr)
     }
 
     /// `aspectInfo(name)` → the aspect record as JSON (`null` if unknown).

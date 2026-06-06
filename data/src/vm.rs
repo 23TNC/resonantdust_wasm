@@ -273,6 +273,20 @@ fn resolve(store: &Store, cat: &Catalog, path: &str) -> Option<Cell> {
       Some(c) => c.clone(),
       None => match &cur {
         Cell::Sym(s) => step(cat.deref(s)?, seg)?.clone(),
+        // A `Ranged` exposes its bounds as members so the DSL can read an
+        // asset's `scale` envelope (`*rec.art.scale.min`/`.max`); a bare
+        // `*…scale` still reads `.val` via `as_int`. Synthesised here (not in
+        // `step`) because the fields are `i64`, not stored `Cell`s — `resolve`
+        // owns its clones so returning a fresh `Cell::Int` is fine.
+        Cell::Ranged { min, max, val } => match seg {
+          Seg::Lit(k) => match k.as_str() {
+            "min" => Cell::Int(*min),
+            "max" => Cell::Int(*max),
+            "val" => Cell::Int(*val),
+            _ => return None,
+          },
+          _ => return None,
+        },
         _ => return None,
       },
     };
@@ -509,7 +523,7 @@ const STEP_CAP: u32 = 1_000_000;
 /// `&h.tint`, …). The engine owns `prims` (so `defs::draw_visuals` reads it
 /// legitimately); the client `makePrimitive` owns the matching render set — the
 /// FFI agreement, not a content registry.
-const PRIM_KINDS: &[&str] = &["hex", "rect", "sprite", "text"];
+const PRIM_KINDS: &[&str] = &["hex", "rect", "sprite", "text", "progress"];
 
 /// Functions callable via `$functions:name call`.
 #[derive(Default, Debug)]
@@ -1428,6 +1442,39 @@ mod tests {
     assert!(matches!(s.read("objects.0"), Some(Cell::Sym(_))), "{:?}", s.read("objects.0"));
     assert!(matches!(s.read("objects.1"), Some(Cell::Sym(_))), "{:?}", s.read("objects.1"));
     assert_eq!(s.read("objects.2"), Some(&Cell::Int(0))); // cost contributed nothing
+  }
+
+  // ring_prims reads the asset's `scale` envelope (a `Ranged`) via member access
+  // (`*rec.art.scale.min`/`.max`) and scales the native size by a pick within it.
+  // A pack with no `scale` reads 0 on both bounds (the DSL then defaults to 100%).
+  #[test]
+  fn ranged_scale_members_resolve() {
+    let aspects = "<aspect>\n  ::pine>\n    @define>\n      aspects &section set\n      $asset::p &art set\n  ::stone>\n    @define>\n      aspects &section set\n      $asset::q &art set\n";
+    // `p` declares a scale envelope (50..100); `q` declares none.
+    let assets = "<asset>\n  ::p>\n    @define>\n      $manifest::m &object set\n      200 &size set\n      50 100 &scale range\n  ::q>\n    @define>\n      $manifest::m &object set\n      128 &size set\n";
+    let manifest = "<manifest>\n  ::m>\n    :neutral>\n      @define>\n        1 &texture array\n        a.png &texture.0 set\n";
+    let mut cat = Catalog::default();
+    cat.add_aspects(&parse(aspects).unwrap());
+    cat.add_assets(&parse(assets).unwrap());
+    cat.add_manifest(&parse(manifest).unwrap());
+
+    let body = "\
+<functions:scaletest>
+  pine aspect recall &rec set
+  *rec.art.scale.min &gotmin set
+  *rec.art.scale.max &gotmax set
+  *rec.art.size *rec.art.scale.max mul 100 div &sz set
+  stone aspect recall &rec set
+  *rec.art.scale.max &nomax set
+";
+    let ro = parse(body).unwrap();
+    let mut s = Store::default();
+    run(find(&ro, "scaletest").unwrap(), &mut s, &[], &cat, &Functions::default()).unwrap();
+
+    assert_eq!(s.read("gotmin"), Some(&Cell::Int(50)));   // envelope min
+    assert_eq!(s.read("gotmax"), Some(&Cell::Int(100)));  // envelope max
+    assert_eq!(s.read("sz"), Some(&Cell::Int(200)));      // 200 * 100/100
+    assert_eq!(s.read("nomax"), Some(&Cell::Int(0)));     // no envelope → 0 (DSL defaults to 100)
   }
 
   // --- Part C: recipe execution (@input match + @output plan) ---

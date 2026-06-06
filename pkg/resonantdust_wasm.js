@@ -385,18 +385,20 @@ export class Content {
         return v1;
     }
     /**
-     * `tilePrims(packed, stock0, stock1)` → the world tile's `PrimList` JSON
-     * from its stored stock (the two zone stock slots).
+     * `tilePrims(packed, stock0, stock1, seed)` → the world tile's `PrimList`
+     * JSON from its stored stock (the two zone stock slots). `seed` is the
+     * tile's `(q,r)` hash, driving the `:visuals` scatter (ring angles, scale).
      * @param {number} packed
      * @param {number} stock0
      * @param {number} stock1
+     * @param {number} seed
      * @returns {string}
      */
-    tilePrims(packed, stock0, stock1) {
+    tilePrims(packed, stock0, stock1, seed) {
         let deferred2_0;
         let deferred2_1;
         try {
-            const ret = wasm.content_tilePrims(this.__wbg_ptr, packed, stock0, stock1);
+            const ret = wasm.content_tilePrims(this.__wbg_ptr, packed, stock0, stock1, seed);
             var ptr1 = ret[0];
             var len1 = ret[1];
             if (ret[3]) {

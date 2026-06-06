@@ -87,10 +87,11 @@ export class Content {
      */
     recipeNames(): string[];
     /**
-     * `tilePrims(packed, stock0, stock1)` → the world tile's `PrimList` JSON
-     * from its stored stock (the two zone stock slots).
+     * `tilePrims(packed, stock0, stock1, seed)` → the world tile's `PrimList`
+     * JSON from its stored stock (the two zone stock slots). `seed` is the
+     * tile's `(q,r)` hash, driving the `:visuals` scatter (ring angles, scale).
      */
-    tilePrims(packed: number, stock0: number, stock1: number): string;
+    tilePrims(packed: number, stock0: number, stock1: number, seed: number): string;
 }
 
 /**
@@ -163,7 +164,7 @@ export interface InitOutput {
     readonly content_recipeMeta: (a: number, b: number, c: number) => [number, number, number, number];
     readonly content_recipeName: (a: number, b: number) => [number, number];
     readonly content_recipeNames: (a: number) => [number, number];
-    readonly content_tilePrims: (a: number, b: number, c: number, d: number) => [number, number, number, number];
+    readonly content_tilePrims: (a: number, b: number, c: number, d: number, e: number) => [number, number, number, number];
     readonly hasCardFlag: (a: number, b: number, c: number, d: number) => number;
     readonly isHexType: (a: number) => number;
     readonly locales_new: (a: number, b: number) => [number, number, number];

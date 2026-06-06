@@ -107,7 +107,7 @@ impl Node {
 
 /// `@`-hooks whose content is a code body.
 fn is_code_hook(name: &str) -> bool {
-  matches!(name, "define" | "init" | "update" | "input" | "output")
+  matches!(name, "define" | "init" | "update" | "input" | "output" | "destroy")
 }
 
 
